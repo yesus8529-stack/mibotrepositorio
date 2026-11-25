@@ -1,0 +1,10 @@
+﻿services:
+  discord-music-bot:
+    build: .
+    container_name: mibotmusic
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./Musica:/app/Musica
+      - ./letras:/app/letras
