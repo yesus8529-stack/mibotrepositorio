@@ -69,6 +69,7 @@ function loadCatalog() {
         return {
             title,
             filePath,
+            lyrics,
             searchableText: normalizeText(`${title} ${lyrics}`)
         };
     });
@@ -143,7 +144,12 @@ function buildControlRows(isPaused = false) {
             .setCustomId('btn_bm25_modal')
             .setLabel('Ranking BM25')
             .setEmoji('📊')
-            .setStyle(ButtonStyle.Success)
+            .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+            .setCustomId('btn_show_lyrics')
+            .setLabel('Letra')
+            .setEmoji('📜')
+            .setStyle(ButtonStyle.Secondary)
     );
 
     return [row1, row2];
@@ -179,7 +185,7 @@ client.once('clientReady', async () => {
     const commands = [
         new SlashCommandBuilder()
             .setName('iniciar')
-            .setDescription('Inicia el reproductor de música con búsqueda booleana y ranking BM25')
+            .setDescription('Inicia el reproductor de música con búsqueda booleana, ranking BM25 y letras')
             .toJSON()
     ];
 
@@ -308,6 +314,38 @@ client.on('interactionCreate', async (interaction) => {
                 });
             }
 
+            if (interaction.customId === 'btn_show_lyrics') {
+                const currentSong = session.songs[0];
+                if (!currentSong) {
+                    return interaction.reply({ content: '❌ No hay ninguna canción sonando.', flags: 64 });
+                }
+
+                // Leer directamente del archivo .txt por si se actualizó
+                const lyricPath = path.join(LYRICS_DIR, `${currentSong.title}.txt`);
+                let lyricText = currentSong.lyrics;
+                if (fs.existsSync(lyricPath)) {
+                    lyricText = fs.readFileSync(lyricPath, 'utf8').trim();
+                }
+
+                if (!lyricText) {
+                    return interaction.reply({
+                        content: `📜 No hay letra registrada en \`letras/${currentSong.title}.txt\`.`,
+                        flags: 64
+                    });
+                }
+
+                const formattedLyrics = lyricText.length > 3950
+                    ? lyricText.slice(0, 3950) + '\n\n*(...letra recortada por límite de Discord)*'
+                    : lyricText;
+
+                const embed = new EmbedBuilder()
+                    .setColor(0x3498db)
+                    .setTitle(`📜 Letra: ${currentSong.title}`)
+                    .setDescription(formattedLyrics);
+
+                return interaction.reply({ embeds: [embed], flags: 64 });
+            }
+
             if (interaction.customId === 'btn_search_modal') {
                 const modal = new ModalBuilder()
                     .setCustomId('modal_boolean_search')
@@ -349,7 +387,6 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             const query = interaction.fields.getTextInputValue('query_input');
-            // Filtrar sobre el catálogo completo y dejar SOLO las canciones que cumplen la consulta
             const matches = session.allSongs.filter(song => evaluateBooleanQuery(query, song.searchableText));
 
             if (matches.length === 0) {
