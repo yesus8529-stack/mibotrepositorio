@@ -1,32 +1,42 @@
-require('dotenv').config();
+﻿require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
-const { 
-    Client, 
-    GatewayIntentBits, 
-    REST, 
-    Routes, 
-    SlashCommandBuilder, 
-    EmbedBuilder, 
-    ActionRowBuilder, 
-    ButtonBuilder, 
+const {
+    Client,
+    GatewayIntentBits,
+    REST,
+    Routes,
+    SlashCommandBuilder,
+    ActionRowBuilder,
+    ButtonBuilder,
     ButtonStyle,
     ModalBuilder,
     TextInputBuilder,
-    TextInputStyle
+    TextInputStyle,
+    EmbedBuilder
 } = require('discord.js');
-
-const { 
-    joinVoiceChannel, 
-    createAudioPlayer, 
-    createAudioResource, 
-    AudioPlayerStatus 
+const {
+    joinVoiceChannel,
+    createAudioPlayer,
+    createAudioResource,
+    AudioPlayerStatus,
+    VoiceConnectionStatus,
+    entersState
 } = require('@discordjs/voice');
+const { BM25Ranker } = require('./bm25');
 
-if (!process.env.DISCORD_TOKEN || !process.env.CLIENT_ID) {
+const TOKEN = process.env.DISCORD_TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;
+
+if (!TOKEN || !CLIENT_ID) {
     console.error('❌ Faltan DISCORD_TOKEN o CLIENT_ID en el archivo .env');
     process.exit(1);
 }
+
+const MUSIC_DIR = path.join(__dirname, 'Musica');
+const LYRICS_DIR = path.join(__dirname, 'letras');
+
+const bm25Ranker = new BM25Ranker(LYRICS_DIR);
 
 const client = new Client({
     intents: [
@@ -35,156 +45,72 @@ const client = new Client({
     ]
 });
 
-const MUSIC_DIR = path.join(__dirname, 'Musica');
-const LYRICS_DIR = path.join(__dirname, 'letras');
-
-if (!fs.existsSync(MUSIC_DIR)) fs.mkdirSync(MUSIC_DIR, { recursive: true });
-if (!fs.existsSync(LYRICS_DIR)) fs.mkdirSync(LYRICS_DIR, { recursive: true });
-
-const FALLBACK_DOCS = [
-    {
-        filename: 'Bronco - Que No Quede Huella.mp3',
-        title: 'Bronco - Que No Quede Huella',
-        text: 'bronco que no quede huella de ti nada adios amor lagrimas dolor pisadas recuerdo'
-    },
-    {
-        filename: 'Clave 7.mp3',
-        title: 'Clave 7',
-        text: 'clave siete 7 carretera trocas federales retenes cargamento sonora comandante'
-    },
-    {
-        filename: 'El baile del beeper.mp3',
-        title: 'El baile del beeper',
-        text: 'el beeper biper pipipi suena mi mensaje llamada tono fiesta baile'
-    },
-    {
-        filename: 'Los Tigres Del Norte - Pedro Y Pablo.mp3',
-        title: 'Los Tigres Del Norte - Pedro Y Pablo',
-        text: 'los tigres del norte pedro y pablo eran hermanos amigo inseparable frontera mojados'
-    }
-];
-
-function tokenize(text) {
-    if (!text) return [];
-    return text
-        .toLowerCase()
-        .normalize("NFD")
-        .replace(/[\u0300-\u036f]/g, "")
-        .replace(/[^a-z0-9\s]/g, " ")
-        .split(/\s+/)
-        .filter(t => t.length > 0);
-}
-
-class BooleanRetrievalModel {
-    constructor() {
-        this.invertedIndex = new Map();
-        this.documents = [];
-    }
-
-    buildIndex(songFiles) {
-        this.invertedIndex.clear();
-        this.documents = [];
-
-        songFiles.forEach((file, index) => {
-            const baseName = file.replace(/\.mp3$/i, '');
-            const txtPath = path.join(LYRICS_DIR, `${baseName}.txt`);
-            let content = '';
-
-            if (fs.existsSync(txtPath)) {
-                content = fs.readFileSync(txtPath, 'utf-8');
-            } else {
-                const fallback = FALLBACK_DOCS.find(d => d.filename.toLowerCase() === file.toLowerCase());
-                content = fallback ? fallback.text : baseName;
-            }
-
-            const docId = index;
-            this.documents.push({
-                docId,
-                title: baseName,
-                filename: file,
-                filePath: path.join(MUSIC_DIR, file)
-            });
-
-            const tokens = new Set(tokenize(content + " " + baseName));
-            for (const token of tokens) {
-                if (!this.invertedIndex.has(token)) {
-                    this.invertedIndex.set(token, new Set());
-                }
-                this.invertedIndex.get(token).add(docId);
-            }
-        });
-    }
-
-    search(queryStr) {
-        const universe = new Set(this.documents.map(d => d.docId));
-        const rawTokens = queryStr.trim().split(/\s+/);
-        if (rawTokens.length === 0) return [];
-
-        let currentResultSet = null;
-        let pendingOp = 'AND';
-        let negateNext = false;
-
-        for (let token of rawTokens) {
-            const upper = token.toUpperCase();
-
-            if (upper === 'AND' || upper === 'OR') {
-                pendingOp = upper;
-                continue;
-            }
-
-            if (upper === 'NOT') {
-                negateNext = true;
-                continue;
-            }
-
-            const term = tokenize(token)[0];
-            if (!term) continue;
-
-            let termPosting = new Set(this.invertedIndex.get(term) || []);
-
-            if (negateNext) {
-                termPosting = new Set([...universe].filter(id => !termPosting.has(id)));
-                negateNext = false;
-            }
-
-            if (currentResultSet === null) {
-                currentResultSet = termPosting;
-            } else {
-                if (pendingOp === 'AND') {
-                    currentResultSet = new Set([...currentResultSet].filter(id => termPosting.has(id)));
-                } else if (pendingOp === 'OR') {
-                    currentResultSet = new Set([...currentResultSet, ...termPosting]);
-                }
-            }
-        }
-
-        if (!currentResultSet) return [];
-        return [...currentResultSet].map(id => this.documents[id]);
-    }
-}
-
-const booleanEngine = new BooleanRetrievalModel();
 const queues = new Map();
 
-const commands = [
-    new SlashCommandBuilder()
-        .setName('iniciar')
-        .setDescription('Inicia el reproductor interactivo con motor booleano')
-].map(command => command.toJSON());
+function normalizeText(str) {
+    return str
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '');
+}
 
-client.once('ready', async () => {
-    console.log(`🤖 Bot listo: ${client.user.tag}`);
-    const rest = new REST({ version: '10', timeout: 30000 }).setToken(process.env.DISCORD_TOKEN);
-    try {
-        await rest.put(
-            Routes.applicationCommands(process.env.CLIENT_ID),
-            { body: commands }
-        );
-        console.log('✅ Comando /iniciar activo.');
-    } catch (error) {
-        console.error('Error registrando comandos:', error);
+function loadCatalog() {
+    if (!fs.existsSync(MUSIC_DIR)) return [];
+    const files = fs.readdirSync(MUSIC_DIR).filter(f => f.toLowerCase().endsWith('.mp3'));
+
+    return files.map(file => {
+        const title = path.parse(file).name;
+        const filePath = path.join(MUSIC_DIR, file);
+        const lyricPath = path.join(LYRICS_DIR, `${title}.txt`);
+        let lyrics = '';
+        if (fs.existsSync(lyricPath)) {
+            lyrics = fs.readFileSync(lyricPath, 'utf8');
+        }
+        return {
+            title,
+            filePath,
+            searchableText: normalizeText(`${title} ${lyrics}`)
+        };
+    });
+}
+
+function evaluateBooleanQuery(query, text) {
+    const tokens = query.trim().split(/\s+/);
+    if (tokens.length === 0) return false;
+
+    let result = null;
+    let currentOp = 'AND';
+    let negateNext = false;
+
+    for (const rawToken of tokens) {
+        const upper = rawToken.toUpperCase();
+        if (upper === 'AND' || upper === 'OR') {
+            currentOp = upper;
+            continue;
+        }
+        if (upper === 'NOT') {
+            negateNext = true;
+            continue;
+        }
+
+        const term = normalizeText(rawToken);
+        let match = text.includes(term);
+        if (negateNext) {
+            match = !match;
+            negateNext = false;
+        }
+
+        if (result === null) {
+            result = match;
+        } else if (currentOp === 'AND') {
+            result = result && match;
+        } else if (currentOp === 'OR') {
+            result = result || match;
+        }
     }
-});
+
+    return Boolean(result);
+}
 
 function buildControlRow(isPaused = false) {
     return new ActionRowBuilder().addComponents(
@@ -193,98 +119,98 @@ function buildControlRow(isPaused = false) {
             .setEmoji('⏹️')
             .setStyle(ButtonStyle.Danger),
         new ButtonBuilder()
-            .setCustomId('btn_toggle_pause')
+            .setCustomId('btn_pause_resume')
             .setEmoji(isPaused ? '▶️' : '⏸️')
-            .setStyle(isPaused ? ButtonStyle.Success : ButtonStyle.Secondary),
+            .setStyle(ButtonStyle.Primary),
         new ButtonBuilder()
             .setCustomId('btn_skip')
             .setEmoji('⏭️')
-            .setStyle(ButtonStyle.Primary),
+            .setStyle(ButtonStyle.Secondary),
         new ButtonBuilder()
             .setCustomId('btn_search_modal')
+            .setLabel('Booleana')
             .setEmoji('🔍')
-            .setStyle(ButtonStyle.Secondary)
+            .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+            .setCustomId('btn_bm25_modal')
+            .setLabel('BM25')
+            .setEmoji('📊')
+            .setStyle(ButtonStyle.Success)
     );
 }
 
-function buildPlayerEmbed(title, totalSongs) {
-    return new EmbedBuilder()
-        .setColor(0x2B2D31)
-        .setTitle(`🎶 ${title}`)
-        .setDescription(`🔁 **Bucle activo** • ${totalSongs} canción(es) en cola`);
-}
-
 async function startTrack(guildId) {
-    const serverQueue = queues.get(guildId);
-    if (!serverQueue || serverQueue.songs.length === 0) return;
+    const session = queues.get(guildId);
+    if (!session || session.songs.length === 0) return;
 
-    const currentSong = serverQueue.songs[0];
+    const currentSong = session.songs[0];
+    const resource = createAudioResource(currentSong.filePath);
+    session.player.play(resource);
+    session.isPaused = false;
 
-    const resource = createAudioResource(currentSong.filePath, {
-        inlineVolume: true
-    });
-    resource.volume.setVolume(0.85);
+    const content = `🎶 **${currentSong.title}**\n🔄 Bucle activo • ${session.songs.length} canciones en cola`;
+    const row = buildControlRow(false);
 
-    serverQueue.player.play(resource);
-    serverQueue.isPaused = false;
-
-    const embed = buildPlayerEmbed(currentSong.title, serverQueue.songs.length);
-    const buttons = buildControlRow(false);
-
-    if (serverQueue.playerMessage) {
-        try {
-            await serverQueue.playerMessage.edit({ embeds: [embed], components: [buttons] });
-            return;
-        } catch (e) {}
+    try {
+        if (session.playerMessage) {
+            await session.playerMessage.edit({ content, components: [row] });
+        } else {
+            session.playerMessage = await session.textChannel.send({ content, components: [row] });
+        }
+    } catch (err) {
+        console.error('Error actualizando mensaje del reproductor:', err.message);
     }
-
-    serverQueue.playerMessage = await serverQueue.textChannel.send({ 
-        embeds: [embed], 
-        components: [buttons] 
-    });
 }
 
-client.on('interactionCreate', async interaction => {
-    if (interaction.isChatInputCommand()) {
-        const { commandName, guildId, member } = interaction;
+client.once('clientReady', async () => {
+    console.log(`🤖 Bot listo: ${client.user.tag}`);
 
-        if (commandName === 'iniciar') {
-            const voiceChannel = member.voice?.channel;
+    const commands = [
+        new SlashCommandBuilder()
+            .setName('iniciar')
+            .setDescription('Inicia el reproductor de música con búsqueda booleana y ranking BM25')
+            .toJSON()
+    ];
+
+    const rest = new REST({ version: '10' }).setToken(TOKEN);
+    try {
+        await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+        console.log('✅ Comando /iniciar activo.');
+    } catch (error) {
+        console.error('Error registrando comando:', error);
+    }
+});
+
+client.on('interactionCreate', async (interaction) => {
+    try {
+        if (interaction.isChatInputCommand() && interaction.commandName === 'iniciar') {
+            await interaction.deferReply({ flags: 64 });
+
+            const voiceChannel = interaction.member?.voice?.channel;
             if (!voiceChannel) {
-                return interaction.reply({ 
-                    content: '❌ Entra a un canal de voz primero.', 
-                    flags: 64 
-                });
+                return interaction.editReply('❌ Debes entrar primero a un canal de voz.');
             }
 
-            const rawFiles = fs.readdirSync(MUSIC_DIR).filter(f => f.toLowerCase().endsWith('.mp3'));
-            if (rawFiles.length === 0) {
-                return interaction.reply({ 
-                    content: '⚠️ No hay archivos `.mp3` en la carpeta `Musica`.', 
-                    flags: 64 
-                });
+            const catalog = loadCatalog();
+            if (catalog.length === 0) {
+                return interaction.editReply('❌ No hay archivos `.mp3` en la carpeta `Musica`.');
             }
 
-            booleanEngine.buildIndex(rawFiles);
-            await interaction.reply({ content: '▶️ Conectando reproductor...', flags: 64 });
+            bm25Ranker.buildIndex();
 
-            const existingQueue = queues.get(guildId);
-            if (existingQueue?.connection) {
-                existingQueue.connection.destroy();
+            const guildId = interaction.guildId;
+            const existing = queues.get(guildId);
+            if (existing) {
+                existing.player.stop();
+                if (existing.connection) existing.connection.destroy();
                 queues.delete(guildId);
             }
-
-            const songQueue = rawFiles.map(file => ({
-                title: file.replace(/\.mp3$/i, ''),
-                filePath: path.join(MUSIC_DIR, file),
-                filename: file
-            }));
 
             const player = createAudioPlayer();
             const connection = joinVoiceChannel({
                 channelId: voiceChannel.id,
                 guildId: guildId,
-                adapterCreator: interaction.guild.voiceAdapterCreator,
+                adapterCreator: interaction.guild.voiceAdapterCreator
             });
 
             player.on('error', error => {
@@ -295,6 +221,7 @@ client.on('interactionCreate', async interaction => {
                 console.error(`Error en conexión de voz [${guildId}]:`, error.message);
             });
 
+            await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
             connection.subscribe(player);
 
             const queueConstruct = {
@@ -302,7 +229,7 @@ client.on('interactionCreate', async interaction => {
                 voiceChannel: voiceChannel,
                 connection: connection,
                 player: player,
-                songs: songQueue,
+                songs: [...catalog],
                 isPaused: false,
                 playerMessage: null
             };
@@ -311,109 +238,164 @@ client.on('interactionCreate', async interaction => {
 
             player.on(AudioPlayerStatus.Idle, () => {
                 const currentSession = queues.get(guildId);
-                if (!currentSession) return;
+                if (!currentSession || currentSession.songs.length === 0) return;
 
-                if (currentSession.songs.length > 0) {
-                    const playedSong = currentSession.songs.shift();
-                    currentSession.songs.push(playedSong);
-                    startTrack(guildId);
-                }
+                const playedSong = currentSession.songs.shift();
+                currentSession.songs.push(playedSong);
+                startTrack(guildId);
             });
 
-            startTrack(guildId);
-        }
-    }
-
-    if (interaction.isButton()) {
-        const session = queues.get(interaction.guildId);
-        if (!session) {
-            return interaction.reply({ content: '❌ Sin reproducción activa.', flags: 64 });
+            await startTrack(guildId);
+            return interaction.editReply('✅ Reproductor iniciado correctamente.');
         }
 
-        if (interaction.customId === 'btn_search_modal') {
-            const modal = new ModalBuilder()
-                .setCustomId('modal_boolean_search')
-                .setTitle('Búsqueda Booleana');
-
-            const textInput = new TextInputBuilder()
-                .setCustomId('query_input')
-                .setLabel('Consulta booleana (AND, OR, NOT):')
-                .setStyle(TextInputStyle.Short)
-                .setPlaceholder('Ej: bronco OR norte | huella OR tigres | trocas OR beeper')
-                .setRequired(true);
-
-            modal.addComponents(new ActionRowBuilder().addComponents(textInput));
-            return interaction.showModal(modal);
-        }
-
-        if (interaction.customId === 'btn_toggle_pause') {
-            if (session.isPaused) {
-                session.player.unpause();
-                session.isPaused = false;
-                return interaction.update({ components: [buildControlRow(false)] });
-            } else {
-                session.player.pause();
-                session.isPaused = true;
-                return interaction.update({ components: [buildControlRow(true)] });
-            }
-        }
-
-        if (interaction.customId === 'btn_skip') {
-            await interaction.deferUpdate();
-            const current = session.songs.shift();
-            session.songs.push(current);
-            startTrack(interaction.guildId);
-            return;
-        }
-
-        if (interaction.customId === 'btn_stop') {
-            session.songs = [];
-            session.player.stop();
-            if (session.connection) session.connection.destroy();
-            queues.delete(interaction.guildId);
-
-            return interaction.update({
-                content: '⏹️ Reproducción finalizada.',
-                embeds: [],
-                components: []
-            });
-        }
-    }
-
-    if (interaction.isModalSubmit()) {
-        if (interaction.customId === 'modal_boolean_search') {
+        if (interaction.isButton()) {
             const session = queues.get(interaction.guildId);
             if (!session) {
-                return interaction.reply({ content: '❌ Sin sesión activa.', flags: 64 });
+                return interaction.reply({ content: '❌ Sin reproducción activa. Usa `/iniciar`.', flags: 64 });
             }
 
-            const rawQuery = interaction.fields.getTextInputValue('query_input');
-            const matchedDocs = booleanEngine.search(rawQuery);
+            if (interaction.customId === 'btn_pause_resume') {
+                if (session.isPaused) {
+                    session.player.unpause();
+                    session.isPaused = false;
+                    return interaction.update({ components: [buildControlRow(false)] });
+                } else {
+                    session.player.pause();
+                    session.isPaused = true;
+                    return interaction.update({ components: [buildControlRow(true)] });
+                }
+            }
 
-            if (matchedDocs.length === 0) {
-                return interaction.reply({ 
-                    content: `🔍 **Modelo Booleano:** Ninguna pista cumple con: \`${rawQuery}\``, 
-                    flags: 64 
+            if (interaction.customId === 'btn_skip') {
+                await interaction.deferUpdate();
+                const current = session.songs.shift();
+                session.songs.push(current);
+                await startTrack(interaction.guildId);
+                return;
+            }
+
+            if (interaction.customId === 'btn_stop') {
+                session.songs = [];
+                session.player.stop();
+                if (session.connection) session.connection.destroy();
+                queues.delete(interaction.guildId);
+
+                return interaction.update({
+                    content: '⏹️ Reproducción finalizada.',
+                    components: []
                 });
             }
 
-            const newQueue = matchedDocs.map(doc => ({
-                title: doc.title,
-                filePath: doc.filePath,
-                filename: doc.filename
-            }));
+            if (interaction.customId === 'btn_search_modal') {
+                const modal = new ModalBuilder()
+                    .setCustomId('modal_boolean_search')
+                    .setTitle('Búsqueda Booleana (AND / OR / NOT)');
 
-            session.songs = newQueue;
+                const input = new TextInputBuilder()
+                    .setCustomId('query_input')
+                    .setLabel('Consulta booleana sobre letras y títulos')
+                    .setPlaceholder('Ej: amor AND noche NOT dolor')
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true);
 
-            const titles = newQueue.map(s => `• **${s.title}**`).join('\n');
-            await interaction.reply({ 
-                content: `🎯 **Cola actualizada con ${newQueue.length} pista(s):**\n${titles}\n*Reproduciendo ahora...*`, 
-                flags: 64 
+                modal.addComponents(new ActionRowBuilder().addComponents(input));
+                return interaction.showModal(modal);
+            }
+
+            if (interaction.customId === 'btn_bm25_modal') {
+                const modal = new ModalBuilder()
+                    .setCustomId('modal_bm25_search')
+                    .setTitle('Ranking Probabilístico (Okapi BM25)');
+
+                const input = new TextInputBuilder()
+                    .setCustomId('bm25_query_input')
+                    .setLabel('Palabras clave o frase libre')
+                    .setPlaceholder('Ej: corazon roto lluvia recuerdos')
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true);
+
+                modal.addComponents(new ActionRowBuilder().addComponents(input));
+                return interaction.showModal(modal);
+            }
+        }
+
+        if (interaction.isModalSubmit() && interaction.customId === 'modal_boolean_search') {
+            await interaction.deferReply({ flags: 64 });
+            const session = queues.get(interaction.guildId);
+            if (!session) {
+                return interaction.editReply('❌ Sin sesión activa.');
+            }
+
+            const query = interaction.fields.getTextInputValue('query_input');
+            const matches = session.songs.filter(song => evaluateBooleanQuery(query, song.searchableText));
+
+            if (matches.length === 0) {
+                return interaction.editReply(`🔍 Sin coincidencias booleanas para: **${query}**`);
+            }
+
+            const rest = session.songs.filter(song => !matches.includes(song));
+            session.songs = [...matches, ...rest];
+            await startTrack(interaction.guildId);
+
+            const listText = matches.slice(0, 10).map((s, i) => `${i + 1}. **${s.title}**`).join('\n');
+            return interaction.editReply(`✅ **${matches.length}** coincidencias booleanas (reproduciendo la #1):\n${listText}`);
+        }
+
+        if (interaction.isModalSubmit() && interaction.customId === 'modal_bm25_search') {
+            await interaction.deferReply({ flags: 64 });
+            const session = queues.get(interaction.guildId);
+            if (!session) {
+                return interaction.editReply('❌ Sin sesión activa.');
+            }
+
+            const query = interaction.fields.getTextInputValue('bm25_query_input');
+            const ranked = bm25Ranker.search(query, 10);
+
+            if (ranked.length === 0) {
+                return interaction.editReply(`📊 Sin documentos relevantes en BM25 para: **${query}**`);
+            }
+
+            const rankedMap = new Map(ranked.map((item, idx) => [normalizeText(item.name), idx]));
+            const matchedSongs = [];
+            const otherSongs = [];
+
+            for (const song of session.songs) {
+                if (rankedMap.has(normalizeText(song.title))) {
+                    matchedSongs.push(song);
+                } else {
+                    otherSongs.push(song);
+                }
+            }
+
+            matchedSongs.sort((a, b) => {
+                return rankedMap.get(normalizeText(a.title)) - rankedMap.get(normalizeText(b.title));
             });
 
-            startTrack(interaction.guildId);
+            if (matchedSongs.length > 0) {
+                session.songs = [...matchedSongs, ...otherSongs];
+                await startTrack(interaction.guildId);
+            }
+
+            const embed = new EmbedBuilder()
+                .setColor(0x2ecc71)
+                .setTitle(`📊 Ranking Probabilístico Okapi BM25`)
+                .setDescription(`**Consulta:** \`${query}\`\n*Reproduciendo el resultado #1 con mayor puntuación RSV:*\n\n` +
+                    ranked.map((r, i) => `**${i + 1}.** ${r.name} — \`Score RSV: ${r.score}\``).join('\n')
+                );
+
+            return interaction.editReply({ embeds: [embed] });
         }
+    } catch (err) {
+        if (err?.code === 10062) return;
+        console.error('Error en interactionCreate:', err);
     }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+client.on('error', console.error);
+process.on('unhandledRejection', (err) => {
+    if (err?.code === 10062) return;
+    console.error('Unhandled rejection:', err);
+});
+
+client.login(TOKEN);
