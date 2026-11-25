@@ -1,4 +1,4 @@
-﻿require('dotenv').config();
+require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const {
@@ -431,7 +431,7 @@ client.on('interactionCreate', async (interaction) => {
             const embed = new EmbedBuilder()
                 .setColor(0x2ecc71)
                 .setTitle(`📊 Ranking Probabilístico Okapi BM25`)
-                .setDescription(`**Consulta:** \`${query}\`\n*Reproduciendo únicamente los ${matchedSongs.length} resultados ordenados por Score RSV:*\n\n` +
+                .setDescription(`**Consulta:** \`${query}\`\n✅ Reproduciendo **únicamente** las **${matchedSongs.length}** canciones encontradas (ordenadas de mayor a menor Score RSV):\n\n` +
                     ranked.map((r, i) => `**${i + 1}.** ${r.name} — \`Score RSV: ${r.score}\``).join('\n')
                 );
 
