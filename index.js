@@ -112,8 +112,8 @@ function evaluateBooleanQuery(query, text) {
     return Boolean(result);
 }
 
-function buildControlRow(isPaused = false) {
-    return new ActionRowBuilder().addComponents(
+function buildControlRows(isPaused = false) {
+    const row1 = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
             .setCustomId('btn_stop')
             .setEmoji('⏹️')
@@ -127,16 +127,26 @@ function buildControlRow(isPaused = false) {
             .setEmoji('⏭️')
             .setStyle(ButtonStyle.Secondary),
         new ButtonBuilder()
+            .setCustomId('btn_reset_queue')
+            .setLabel('Todo')
+            .setEmoji('🔄')
+            .setStyle(ButtonStyle.Secondary)
+    );
+
+    const row2 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
             .setCustomId('btn_search_modal')
-            .setLabel('Booleana')
+            .setLabel('Búsqueda Booleana')
             .setEmoji('🔍')
-            .setStyle(ButtonStyle.Secondary),
+            .setStyle(ButtonStyle.Primary),
         new ButtonBuilder()
             .setCustomId('btn_bm25_modal')
-            .setLabel('BM25')
+            .setLabel('Ranking BM25')
             .setEmoji('📊')
             .setStyle(ButtonStyle.Success)
     );
+
+    return [row1, row2];
 }
 
 async function startTrack(guildId) {
@@ -148,14 +158,15 @@ async function startTrack(guildId) {
     session.player.play(resource);
     session.isPaused = false;
 
-    const content = `🎶 **${currentSong.title}**\n🔄 Bucle activo • ${session.songs.length} canciones en cola`;
-    const row = buildControlRow(false);
+    const modeLabel = session.filterLabel ? ` • Filtro: **${session.filterLabel}**` : '';
+    const content = `🎶 **${currentSong.title}**\n🔄 Bucle activo • ${session.songs.length} en cola${modeLabel}`;
+    const components = buildControlRows(false);
 
     try {
         if (session.playerMessage) {
-            await session.playerMessage.edit({ content, components: [row] });
+            await session.playerMessage.edit({ content, components });
         } else {
-            session.playerMessage = await session.textChannel.send({ content, components: [row] });
+            session.playerMessage = await session.textChannel.send({ content, components });
         }
     } catch (err) {
         console.error('Error actualizando mensaje del reproductor:', err.message);
@@ -229,7 +240,9 @@ client.on('interactionCreate', async (interaction) => {
                 voiceChannel: voiceChannel,
                 connection: connection,
                 player: player,
+                allSongs: [...catalog],
                 songs: [...catalog],
+                filterLabel: null,
                 isPaused: false,
                 playerMessage: null
             };
@@ -259,11 +272,11 @@ client.on('interactionCreate', async (interaction) => {
                 if (session.isPaused) {
                     session.player.unpause();
                     session.isPaused = false;
-                    return interaction.update({ components: [buildControlRow(false)] });
+                    return interaction.update({ components: buildControlRows(false) });
                 } else {
                     session.player.pause();
                     session.isPaused = true;
-                    return interaction.update({ components: [buildControlRow(true)] });
+                    return interaction.update({ components: buildControlRows(true) });
                 }
             }
 
@@ -271,6 +284,14 @@ client.on('interactionCreate', async (interaction) => {
                 await interaction.deferUpdate();
                 const current = session.songs.shift();
                 session.songs.push(current);
+                await startTrack(interaction.guildId);
+                return;
+            }
+
+            if (interaction.customId === 'btn_reset_queue') {
+                await interaction.deferUpdate();
+                session.songs = [...session.allSongs];
+                session.filterLabel = null;
                 await startTrack(interaction.guildId);
                 return;
             }
@@ -328,18 +349,19 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             const query = interaction.fields.getTextInputValue('query_input');
-            const matches = session.songs.filter(song => evaluateBooleanQuery(query, song.searchableText));
+            // Filtrar sobre el catálogo completo y dejar SOLO las canciones que cumplen la consulta
+            const matches = session.allSongs.filter(song => evaluateBooleanQuery(query, song.searchableText));
 
             if (matches.length === 0) {
                 return interaction.editReply(`🔍 Sin coincidencias booleanas para: **${query}**`);
             }
 
-            const rest = session.songs.filter(song => !matches.includes(song));
-            session.songs = [...matches, ...rest];
+            session.songs = [...matches];
+            session.filterLabel = `Booleana (${query})`;
             await startTrack(interaction.guildId);
 
             const listText = matches.slice(0, 10).map((s, i) => `${i + 1}. **${s.title}**`).join('\n');
-            return interaction.editReply(`✅ **${matches.length}** coincidencias booleanas (reproduciendo la #1):\n${listText}`);
+            return interaction.editReply(`✅ Reproduciendo **únicamente** las **${matches.length}** coincidencias booleanas:\n${listText}`);
         }
 
         if (interaction.isModalSubmit() && interaction.customId === 'modal_bm25_search') {
@@ -357,30 +379,22 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             const rankedMap = new Map(ranked.map((item, idx) => [normalizeText(item.name), idx]));
-            const matchedSongs = [];
-            const otherSongs = [];
-
-            for (const song of session.songs) {
-                if (rankedMap.has(normalizeText(song.title))) {
-                    matchedSongs.push(song);
-                } else {
-                    otherSongs.push(song);
-                }
-            }
+            const matchedSongs = session.allSongs.filter(song => rankedMap.has(normalizeText(song.title)));
 
             matchedSongs.sort((a, b) => {
                 return rankedMap.get(normalizeText(a.title)) - rankedMap.get(normalizeText(b.title));
             });
 
             if (matchedSongs.length > 0) {
-                session.songs = [...matchedSongs, ...otherSongs];
+                session.songs = [...matchedSongs];
+                session.filterLabel = `BM25 (${query})`;
                 await startTrack(interaction.guildId);
             }
 
             const embed = new EmbedBuilder()
                 .setColor(0x2ecc71)
                 .setTitle(`📊 Ranking Probabilístico Okapi BM25`)
-                .setDescription(`**Consulta:** \`${query}\`\n*Reproduciendo el resultado #1 con mayor puntuación RSV:*\n\n` +
+                .setDescription(`**Consulta:** \`${query}\`\n*Reproduciendo únicamente los ${matchedSongs.length} resultados ordenados por Score RSV:*\n\n` +
                     ranked.map((r, i) => `**${i + 1}.** ${r.name} — \`Score RSV: ${r.score}\``).join('\n')
                 );
 
